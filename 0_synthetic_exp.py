@@ -1,186 +1,171 @@
-#%%
-"""Simple synthetic experiments."""
+"""Synthetic data experiments."""
 
 import os
 import time
-import numba
-import numpy as np
+import tqdm
+import argparse
 import matplotlib as mpl
 import matplotlib.pyplot as plt
 from joblib import Parallel, delayed
-from sklearn.base import BaseEstimator, ClassifierMixin, clone
-from sklearn.model_selection import train_test_split
+import numpy as np
+from scipy import linalg
 from sklearn.utils import check_random_state
 import threadpoolctl
-from bandpy.utils import format_duration
+from utils import (format_duration, args_2_str, Ridge, AveragingLinearBinaryClassifier,
+                   make_classif, theoretical_error, type_1_error)
+
 
 mpl.rcParams["text.usetex"] = True
 mpl.rcParams["text.latex.preamble"] = r"\usepackage{amsmath}" r"\usepackage{amssymb}"
 mpl.rcParams['figure.dpi'] = 400
+
 
 t0_global = time.perf_counter()
 
 
 ###############################################################################
 # Globals
+fontsize = 10
+seed = 0
+random_state = check_random_state(seed)
+colors = plt.rcParams["axes.prop_cycle"].by_key()["color"]
 
-def make_classif(n_samples, l_Sigma, l_mu, test_size=0.2, random_state=None):
-    """Return a simple binary classification dataset."""
-    assert len(l_mu) == 2
-    assert len(l_Sigma) == 2
-
-    random_state = check_random_state(random_state)
-
-    d = len(l_mu[0])
-    n_samples_per_class = int(n_samples / 2)
-
-    l_X, l_y = [], []
-    for mu, sigma, label in zip(l_mu, l_Sigma, [0, 1]):
-        Z = random_state.randn(n_samples_per_class, d)
-        l_X.append(mu + Z.dot(np.linalg.cholesky(sigma).T))
-        l_y.append(label * np.ones(n_samples_per_class))
-
-    X, y = np.r_[l_X[0], l_X[1]], np.r_[l_y[0], l_y[1]]
-
-    return train_test_split(X, y, test_size=test_size, shuffle=True, random_state=random_state)
-
-
-class ModelAveragingClassif(BaseEstimator, ClassifierMixin):
-    def __init__(self, base_model, n_clfs=1, random_state=None):
-        self.n_clfs = n_clfs
-        self.models = [clone(base_model) for _ in range(self.n_clfs)]
-        self.random_state = check_random_state(random_state)
-
-    def fit(self, X, y):
-        split_indices = np.array_split(self.random_state.permutation(np.arange(len(X))), self.n_clfs)
-        self.fitted_models_ = [model.fit(X[idx, :], y[idx]) for idx, model in zip(split_indices, self.models)]
-        return self
-
-    def predict(self, X):
-        mean_pred = np.mean([model.predict(X) for model in self.fitted_models_], axis=0)
-        return np.round(mean_pred).astype(int)
-
-
-class LinearClassifier(BaseEstimator, ClassifierMixin):
-    def __init__(self, alpha=1.0):
-        self.alpha = alpha
-
-    def _add_bias(self, X):
-        return np.c_[np.ones(X.shape[0]), X]
-
-    def fit(self, X, y):
-        Xb = self._add_bias(X)
-        y = np.where(y == 0, -1, 1)
-        alpha_Id = self.alpha * np.eye(X.shape[1] + 1)
-        alpha_Id[0, 0] = 0
-        self.w_ = np.linalg.solve(Xb.T @ Xb + alpha_Id, Xb.T @ y)
-        return self
-
-    def predict(self, X):
-        return (self._add_bias(X) @ self.w_ >= 0).astype(int)
-
-
-def run_one_scenario(n_clfs, n_samples, lbda, l_Sigma, l_mu, metric_func,
-                     test_size=0.95, n_trials=100, random_state=None):
+def empirical_error(n_clfs, lbda, err_func, X_train, X_test, y_train, y_test,
+                    n_trials=100, random_state=None):
     """Run on experiment on the givne scenario."""
-    n_samples = int(n_samples / (1.0 - test_size))
-    base_model = LinearClassifier(alpha=lbda)
+    base_model = Ridge(alpha=lbda)
 
     with threadpoolctl.threadpool_limits(limits=1, user_api='blas'):
 
-        l_acc = []
+        l_err = []
         for _ in range(n_trials):
-            X_train, X_test, y_train, y_test = make_classif(n_samples, l_Sigma, l_mu, test_size=test_size)
-            clf = ModelAveragingClassif(base_model=base_model, n_clfs=n_clfs, random_state=random_state)
-            l_acc.append(metric_func(clf.fit(X_train, y_train).predict(X_test), y_test))
+            clf = AveragingLinearBinaryClassifier(base_model=base_model, n_clfs=n_clfs,
+                                                  random_state=random_state)
+            l_err.append(err_func(clf.fit(X_train, y_train).predict(X_test), y_test))
 
-    return np.mean(l_acc), np.std(l_acc)
-
-
-@numba.njit
-def acc(pred, y):
-    return np.mean(pred == y)
+    return np.mean(l_err), np.std(l_err)
 
 
-@numba.njit
-def mse(pred, y):
-    return 0.5 * np.mean(np.square(y - pred))
+def get_sigma(d, cov_mat_type='identity', equal=True, high=1.0, random_state=None):
+
+    random_state = check_random_state(random_state)
+
+    if cov_mat_type == 'identity':
+        Sigma = np.eye(d)
+        return np.array([Sigma, Sigma])
+
+    elif cov_mat_type == 'toeplitz':
+        Sigma = linalg.toeplitz(0.0**np.arange(d))
+        return np.array([Sigma, Sigma])
+
+    elif cov_mat_type == 'diag_random':
+        if equal:
+            Sigma = random_state.uniform(low=0.0, high=high, size=d) * np.eye(d)
+            return np.array([Sigma, Sigma])
+
+        else:
+            Sigma_1 = random_state.uniform(low=0.0, high=high, size=d) * np.eye(d)
+            Sigma_2 = random_state.uniform(low=0.0, high=high, size=d) * np.eye(d)
+            return np.array([Sigma_1, Sigma_2])
+
+    elif cov_mat_type == 'full_random':
+        if equal:
+            X = random_state.randn(d, 5000)
+            Sigma = X @ X.T / np.linalg.norm(X @ X.T)
+            return np.array([Sigma, Sigma])
+
+        else:
+            X_1 = random_state.randn(d, 500)
+            Sigma_1 = X_1 @ X_1.T / np.linalg.norm(X_1 @ X_1.T)
+            X_2 = random_state.randn(d, 5000)
+            Sigma_2 = X_2 @ X_2.T / np.linalg.norm(X_2 @ X_2.T)
+            return np.array([Sigma_1, Sigma_2])
+
+    else:
+        raise ValueError(f"'cov_mat_type' not understood, got {cov_mat_type}")
+
+
+def e_(i, d):
+    """Return the first canonical vector."""
+    e_ = np.zeros((d,))
+    e_[i-1] = 1.0
+    return e_
 
 
 ###############################################################################
 # Main
-
 if __name__ == '__main__':
 
-    plot_dir = "figures__0_synthetic_exp"
-    if not os.path.isdir(plot_dir):
-        os.makedirs(plot_dir)
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--dim', type=int, help="Dimension.", default=100)
+    parser.add_argument('--n-samples', type=int, help="Nb of train samples for each class.", default=500)
+    parser.add_argument('--m-max', type=int, help="Maximal number of models to ensemble.", default=100)
+    parser.add_argument('--l-lbda', type=float, nargs="+", help="List of the regularization (e.g., --l-lbda 0.1 0.01 0.001).", default=[1e-1, 1e1])
+    parser.add_argument('--cov-mat-type', type=str, help="Type of covariance matrix.", default='identity')
+    parser.add_argument('--n-trials', type=int, help="Nb of trials.", default=10)
+    parser.add_argument('--n-jobs', type=int, help="Nb of CPUs.", default=1)
+    args = parser.parse_args()
 
-    nrows, ncols = 1, 1
-    fig, axis = plt.subplots(nrows=nrows, ncols=ncols, squeeze=False, figsize=(ncols*3.0, nrows*3.0))
+    main_figures_dir = "figures__0_synthetic_exp"
+    if not os.path.isdir(main_figures_dir):
+        os.makedirs(main_figures_dir)
 
-    fontsize = 11
-    seed = 0
-    random_state = check_random_state(seed)
-    n_trials = 100
-    verbose = 10
-    n_jobs = 30
+    sub_figure_dir = os.path.join(main_figures_dir, 'figure____' + args_2_str(args))
+    if not os.path.isdir(sub_figure_dir):
+        os.makedirs(sub_figure_dir)
 
-    metric_func = mse
-    metric_func_name = r'$\mathbf{E}\left[\frac{1}{2}\left(\underset{m}{\sum} f_m(X) - Y\right)^2\right]$'
-    # metric_func = acc
-    # metric_func_name = r'$\mathbf{E}\left[1_{\{f_m(X) \neq Y\}}\right]$'
+    n_per_class = np.array([args.n_samples, args.n_samples])
+    l_m = np.arange(1, args.m_max + 1)
 
-    d = 1000
-    n = d
-    test_size = 0.9
-    l_lbda = [1e-6, 1e3, 1e6]
-    colors = ['tab:orange', 'tab:blue']
+    l_mu = np.array([0.9 * e_(1, args.dim), -0.9 * e_(1, args.dim)])
+    l_Sigma = get_sigma(args.dim, cov_mat_type=args.cov_mat_type, equal=True, random_state=random_state)
 
-    m_max = d - 1
-    m_min = 1
-    l_m = np.linspace(m_min, m_max, m_max - m_min, dtype=int)
+    X_train, X_test, y_train, y_test = make_classif(args.n_samples, l_Sigma, l_mu)
 
-    l_Sigma = [X @ X.T / np.linalg.norm(X @ X.T) for X in [random_state.randn(d, d) for _ in range(2)]]
-    # l_Sigma = [np.eye(d) for _ in range(2)]
+    ###########################################################################
+    # Main loop
 
-    beta = 2.0
-    delta_mu = beta / np.sqrt(d) * np.max([np.linalg.eigvals(S) for S in l_Sigma])
-    l_mu = [np.zeros(d), delta_mu * np.ones(d)]
+    nrows, ncols = len(args.l_lbda), 1
+    fig, axis = plt.subplots(nrows=nrows, ncols=ncols, squeeze=False,
+                             figsize=(ncols*2.75, nrows*2.5))
 
-    print("[Main] Main loop:")
+    for i in tqdm.tqdm(range(len(args.l_lbda)), desc="[Main] Main loop"):
 
-    for color, lbda in zip(colors, l_lbda):
+        color, lbda = colors[i], args.l_lbda[i]
 
-        print(f"[Main] lbda={lbda:.1e}...")
+        # empirical results
+        kwargs = dict(lbda=lbda, err_func=type_1_error, X_train=X_train, X_test=X_test,
+                      y_train=y_train, y_test=y_test, random_state=random_state,
+                      n_trials=args.n_trials)
+        delayed_runs = (delayed(empirical_error)(n_clfs=m, **kwargs) for m in l_m)
+        l_mean_err, l_std_err = zip(*Parallel(n_jobs=args.n_jobs)(delayed_runs))
+        mean_err = np.array(l_mean_err)
+        std_err = np.array(l_std_err)
 
-        t0 = time.perf_counter()
+        # theoretical results
+        kwargs = dict(l_Sigma=l_Sigma, l_mu=l_mu, lbda=lbda)
+        th_err = [theoretical_error(m=m, n_per_class=n_per_class//m, **kwargs) for m in l_m]
 
-        l_mean_acc, l_std_acc = zip(*Parallel(verbose=verbose, n_jobs=n_jobs)(delayed(run_one_scenario)(
-                                                    n_clfs=m, n_samples=n, lbda=lbda, l_Sigma=l_Sigma,
-                                                    l_mu=l_mu, test_size=test_size, metric_func=metric_func,
-                                                    random_state=random_state, n_trials=n_trials)
-                                                    for m in l_m))
+        label = r'$\lambda=' + f'{lbda:.2f}' + r'$ ($m^*=' + f'{np.argmin(mean_err)}'
+        label += r'$, $\mathrm{err}^*=' + f'{np.min(mean_err):.3f}' + r'$)'
+        axis[i, 0].plot(l_m, mean_err, linestyle='solid', color=color, label=label, lw=1.0, alpha=0.75)
+        axis[i, 0].plot(l_m, th_err, linestyle='dashed', color='tab:gray', lw=1.0, alpha=0.75)
+        axis[i, 0].fill_between(l_m, mean_err - std_err, mean_err + std_err, color=color, alpha=0.1)
 
-        mean_acc = np.array(l_mean_acc)
-        std_acc = np.array(l_std_acc)
-
-        axis[0, 0].plot(l_m, mean_acc, color=color, label=r'$\lambda=' + f'{lbda:.1e}' + r'$', lw=1.0, alpha=0.75)
-        axis[0, 0].fill_between(l_m, mean_acc - std_acc, mean_acc + std_acc, color=color, alpha=0.1)
-
-    axis[0, 0].set_xlabel(r"$m$ ($d=$" + f"{d}" + r",$n=$" + f"{n}" + r")", fontsize=fontsize)
-    axis[0, 0].set_ylabel(metric_func_name, fontsize=fontsize)
-    axis[0, 0].legend(ncol=1, loc='upper center', bbox_to_anchor=(0.5, 1.3), fontsize=int(0.75*fontsize))
+        xlabel = r"\begin{center}$m$\\$d=$" + f"{args.dim}" + r", $n^{\mathrm{train}}_{\mathrm{class}}=$" + f"{args.n_samples}"
+        xlabel += ", $\Sigma=$" + f"'{args.cov_mat_type}'" + r"\end{center}"
+        axis[i, 0].set_xlabel(xlabel, fontsize=fontsize)
+        ylabel = r'$\mathrm{err} = \mathbf{E}\left[1_{\{f_m(X) \neq Y\}}\right]$'
+        axis[i, 0].set_ylabel(ylabel, fontsize=fontsize)
+        axis[i, 0].legend(ncol=1, loc='lower center', bbox_to_anchor=(0.35, 1.1),
+                        fontsize=int(0.8*fontsize))
 
     fig.tight_layout()
 
-    plot_filename = os.path.join(plot_dir, 'score_evolution')
-    fig.savefig(plot_filename + ".png", dpi=300)
-    fig.savefig(plot_filename + ".pdf", dpi=300)
-    fig.show()
+    figure_filename = os.path.join(sub_figure_dir, 'score_evolution')
+    fig.savefig(figure_filename + ".png", dpi=300)
+    fig.savefig(figure_filename + ".pdf", dpi=300)
 
 ###############################################################################
 # Timing
 print(f"[Main] Experiment runtime: {format_duration(time.perf_counter() - t0_global)}")
-
-#%%
